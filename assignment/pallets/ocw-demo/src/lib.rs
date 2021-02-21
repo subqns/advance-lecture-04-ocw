@@ -6,6 +6,7 @@
 mod tests;
 
 use core::{convert::TryInto, fmt};
+use num_traits::float::FloatCore;
 use frame_support::{
 	debug, decl_error, decl_event, decl_module, decl_storage, dispatch::DispatchResult,
 };
@@ -52,6 +53,7 @@ pub const UNSIGNED_TXS_PRIORITY: u64 = 100;
 
 // We are fetching information from the github public API about organization`substrate-developer-hub`.
 pub const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
+pub const HTTP_ASSET_REMOTE_REQUEST: &str = "https://api.coincap.io/v2/assets/polkadot";
 pub const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
 
 pub const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
@@ -113,6 +115,23 @@ struct GithubInfo {
 	public_repos: u32,
 }
 
+#[derive(Deserialize, Encode, Decode, Default)]
+struct AssetInfo {
+	data: AssetData,
+	timestamp: u64,
+}
+
+#[allow(non_snake_case)]
+#[derive(Deserialize, Encode, Decode, Default)]
+struct AssetData {
+	#[serde(deserialize_with = "de_string_to_bytes")]
+	id: Vec<u8>,
+	#[serde(deserialize_with = "de_string_to_bytes")]
+	symbol: Vec<u8>,
+	#[serde(deserialize_with = "de_string_to_bytes")]
+	priceUsd: Vec<u8>,
+}
+
 pub fn de_string_to_bytes<'de, D>(de: D) -> Result<Vec<u8>, D::Error>
 where
 	D: Deserializer<'de>,
@@ -149,6 +168,7 @@ decl_storage! {
 	trait Store for Module<T: Trait> as Example {
 		/// A vector of recently submitted numbers. Bounded by NUM_VEC_LEN
 		Numbers get(fn numbers): VecDeque<u32>;
+		Prices get(fn prices): VecDeque<u32>;
 	}
 }
 
@@ -160,6 +180,7 @@ decl_event!(
 	{
 		/// Event generated when a new number is accepted to contribute to the average.
 		NewNumber(Option<AccountId>, u32),
+		NewPrice(Option<AccountId>, u32),
 	}
 );
 
@@ -180,6 +201,10 @@ decl_error! {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+
+		AcquireStorageLockError,
+		ConvertToStringError,
+		ParsingToF64Error,
 	}
 }
 
@@ -222,26 +247,31 @@ decl_module! {
 			Ok(())
 		}
 
+		#[weight = 10000]
+		pub fn submit_dot_price_with_signed_payload(origin, payload: Payload<T::Public>,
+			_signature: T::Signature) -> DispatchResult
+		{
+			let _ = ensure_none(origin)?;
+			// we don't need to verify the signature here because it has been verified in
+			//   `validate_unsigned` function when sending out the unsigned tx.
+			let Payload { number, public } = payload;
+			debug::info!("submit_dot_price_with_signed_payload: ({}, {:?})", number, public);
+			Self::append_or_replace_price(number);
+
+			Self::deposit_event(RawEvent::NewPrice(None, number));
+			Ok(())
+		}
+
 		fn offchain_worker(block_number: T::BlockNumber) {
 			debug::info!("Entering off-chain worker");
 
-			// Here we are showcasing various techniques used when running off-chain workers (ocw)
-			// 1. Sending signed transaction from ocw
-			// 2. Sending unsigned transaction from ocw
-			// 3. Sending unsigned transactions with signed payloads from ocw
-			// 4. Fetching JSON via http requests in ocw
-			const TX_TYPES: u32 = 4;
-			let modu = block_number.try_into().map_or(TX_TYPES, |bn: u32| bn % TX_TYPES);
-			let result = match modu {
-				0 => Self::offchain_signed_tx(block_number),
-				1 => Self::offchain_unsigned_tx(block_number),
-				2 => Self::offchain_unsigned_tx_signed_payload(block_number),
-				3 => Self::fetch_github_info(),
-				_ => Err(Error::<T>::UnknownOffchainMux),
-			};
-
-			if let Err(e) = result {
-				debug::error!("offchain_worker error: {:?}", e);
+			match Self::fetch_dot_price() {
+				Ok(json) => {
+					let _ = Self::offchain_price_with_signed_payload(json);
+				},
+				Err(e) => {
+					debug::error!("offchain_worker error: {:?}", e);
+				}
 			}
 		}
 	}
@@ -257,6 +287,16 @@ impl<T: Trait> Module<T> {
 			}
 			numbers.push_back(number);
 			debug::info!("Number vector: {:?}", numbers);
+		});
+	}
+
+	fn append_or_replace_price(price: u32) {
+		Prices::mutate(|prices| {
+			if prices.len() == NUM_VEC_LEN {
+				let _ = prices.pop_front();
+			}
+			prices.push_back(price);
+			debug::info!("Price vector: {:?}", prices);
 		});
 	}
 
@@ -311,6 +351,38 @@ impl<T: Trait> Module<T> {
 		Ok(())
 	}
 
+	fn fetch_dot_price() -> Result<AssetInfo, Error<T>> {
+		let mut lock = StorageLock::<BlockAndTime<Self>>::with_block_and_time_deadline(
+			b"offchain-demo-pk::lock", LOCK_BLOCK_EXPIRATION,
+			rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION)
+		);
+
+		if let Ok(_guard) = lock.try_lock() {
+			match Self::fetch_price_n_parse() {
+				Ok(gh_info) => { return Ok(gh_info); }
+				Err(err) => { return Err(err); }
+			}
+		}
+		Err(Error::<T>::AcquireStorageLockError.into())
+	}
+
+	fn fetch_price_n_parse() -> Result<AssetInfo, Error<T>> {
+		let resp_bytes = Self::fetch_asset_from_remote().map_err(|e| {
+			debug::error!("fetch_from_remote error: {:?}", e);
+			Error::<T>::HttpFetchingError
+		})?;
+
+		let resp_str = str::from_utf8(&resp_bytes).map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+		// Print out our fetched JSON string
+		debug::info!("{}", resp_str);
+
+		// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
+		let data_info: AssetInfo = serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+		Ok(data_info)
+	}
+
 	/// Fetch from remote and deserialize the JSON to a struct
 	fn fetch_n_parse() -> Result<GithubInfo, Error<T>> {
 		let resp_bytes = Self::fetch_from_remote().map_err(|e| {
@@ -335,6 +407,42 @@ impl<T: Trait> Module<T> {
 
 		// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
 		let request = rt_offchain::http::Request::get(HTTP_REMOTE_REQUEST);
+
+		// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
+		let timeout = sp_io::offchain::timestamp()
+			.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+
+		// For github API request, we also need to specify `user-agent` in http request header.
+		//   See: https://developer.github.com/v3/#user-agent-required
+		let pending = request
+			.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
+			.deadline(timeout) // Setting the timeout time
+			.send() // Sending the request out by the host
+			.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+		// By default, the http request is async from the runtime perspective. So we are asking the
+		//   runtime to wait here.
+		// The returning value here is a `Result` of `Result`, so we are unwrapping it twice by two `?`
+		//   ref: https://substrate.dev/rustdocs/v2.0.0/sp_runtime/offchain/http/struct.PendingRequest.html#method.try_wait
+		let response = pending
+			.try_wait(timeout)
+			.map_err(|_| <Error<T>>::HttpFetchingError)?
+			.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+		if response.code != 200 {
+			debug::error!("Unexpected http request status code: {}", response.code);
+			return Err(<Error<T>>::HttpFetchingError);
+		}
+
+		// Next we fully read the response body and collect it to a vector of bytes.
+		Ok(response.body().collect::<Vec<u8>>())
+	}
+
+	fn fetch_asset_from_remote() -> Result<Vec<u8>, Error<T>> {
+		debug::info!("sending request to: {}", HTTP_ASSET_REMOTE_REQUEST);
+
+		// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
+		let request = rt_offchain::http::Request::get(HTTP_ASSET_REMOTE_REQUEST);
 
 		// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
 		let timeout = sp_io::offchain::timestamp()
@@ -438,6 +546,37 @@ impl<T: Trait> Module<T> {
 		debug::error!("No local account available");
 		Err(<Error<T>>::NoLocalAcctForSigning)
 	}
+
+	fn offchain_price_with_signed_payload(json: AssetInfo) -> Result<(), Error<T>> {
+		let signer = Signer::<T, T::AuthorityId>::any_account();
+
+		let price_u8 = json.data.priceUsd;
+		let price_f64: f64 = core::str::from_utf8(&price_u8)
+			.map_err(|_| {
+				Error::<T>::ConvertToStringError
+			})?
+			.parse::<f64>()
+			.map_err(|_| {
+				Error::<T>::ParsingToF64Error
+			})?;
+
+		let price = (price_f64 * 10f64.powi(8).round()) as u32;
+
+		debug::info!("final price: {}", price);
+
+		if let Some((_, res)) = signer.send_unsigned_transaction(
+			|acct| Payload { number: price, public: acct.public.clone() },
+			Call::submit_dot_price_with_signed_payload) {
+			return res.map_err(|_| {
+				debug::error!("Failed in offchain_price_with_signed_payload");
+				Error::<T>::OffchainUnsignedTxSignedPayloadError
+			});
+		}
+
+		debug::error!("No local account available");
+
+		Err(Error::<T>::NoLocalAcctForSigning)
+	}
 }
 
 impl<T: Trait> frame_support::unsigned::ValidateUnsigned for Module<T> {
@@ -458,6 +597,12 @@ impl<T: Trait> frame_support::unsigned::ValidateUnsigned for Module<T> {
 					return InvalidTransaction::BadProof.into();
 				}
 				valid_tx(b"submit_number_unsigned_with_signed_payload".to_vec())
+			},
+			Call::submit_dot_price_with_signed_payload(ref payload, ref signature) => {
+				if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
+					return InvalidTransaction::BadProof.into();
+				}
+				valid_tx(b"submit_dot_price_with_signed_payload".to_vec())
 			},
 			_ => InvalidTransaction::Call.into(),
 		}
